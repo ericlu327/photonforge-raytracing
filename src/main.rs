@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use winit::{
     event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -15,20 +16,26 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    // winit 0.29: EventLoop::new() -> Result<...>
     let event_loop = EventLoop::new()?;
-    // Wrap the window in Arc so we can share it with the renderer and the closure.
+
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title("PhotonForge RT — Rust/wgpu")
+            .with_title("PhotonForge RT — starting…")
             .build(&event_loop)?,
     );
 
-    // Renderer needs a &Window
+    // Create renderer (needs &Window)
     let mut renderer = Renderer::new(window.as_ref()).await?;
 
+    // Input state
     let mut mouse_down = false;
     let mut last_mouse_pos: Option<(f32, f32)> = None;
-    let win_for_loop = window.clone(); // capture a clone for the event loop
+
+    // Perf counters
+    let win_for_loop = window.clone();
+    let mut frames: u32 = 0;
+    let mut last_tick = Instant::now();
 
     event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
@@ -36,15 +43,21 @@ async fn run() -> Result<()> {
         match event {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
+
                 WindowEvent::Resized(size) => renderer.resize(size),
+
                 WindowEvent::RedrawRequested => {
                     if let Err(e) = renderer.render() {
                         eprintln!("render error: {e:?}");
+                    } else {
+                        frames += 1;
                     }
                 }
+
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
                     handle_keyboard(&mut renderer, &key_event);
                 }
+
                 WindowEvent::MouseInput { state, button, .. } => {
                     if button == MouseButton::Left {
                         mouse_down = state == ElementState::Pressed;
@@ -53,6 +66,7 @@ async fn run() -> Result<()> {
                         }
                     }
                 }
+
                 WindowEvent::CursorMoved { position, .. } => {
                     if mouse_down {
                         if let Some((lx, ly)) = last_mouse_pos {
@@ -63,6 +77,7 @@ async fn run() -> Result<()> {
                         last_mouse_pos = Some((position.x as f32, position.y as f32));
                     }
                 }
+
                 WindowEvent::MouseWheel { delta, .. } => {
                     let s = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
@@ -70,16 +85,29 @@ async fn run() -> Result<()> {
                     };
                     renderer.on_scroll(s);
                 }
+
                 _ => {}
             },
+
             Event::AboutToWait => {
-                // Request redraw each tick on the Arc<Window>
+                // Update the title once per second with FPS + perf metrics
+                if last_tick.elapsed() >= Duration::from_secs(1) {
+                    let fps = frames;
+                    frames = 0;
+                    last_tick = Instant::now();
+                    let line = renderer.perf_line(); // <-- ms numbers
+                    win_for_loop.set_title(&format!("PhotonForge RT — {} FPS | {}", fps, line));
+                    // Optional console log:
+                    // println!("FPS: {} | {}", fps, line);
+                }
+                // keep redrawing
                 win_for_loop.request_redraw();
             }
+
             _ => {}
         }
-    })?; // propagate the Result from run()
-
+    })?;
+    // unreachable
     Ok(())
 }
 
