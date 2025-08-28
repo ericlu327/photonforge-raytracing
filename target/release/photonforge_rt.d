@@ -1,0 +1,1 @@
+C:\Users\xxeri\Desktop\ray\target\release\photonforge_rt.exe: C:\Users\xxeri\Desktop\ray\shaders\blit.wgsl C:\Users\xxeri\Desktop\ray\shaders\compute.wgsl C:\Users\xxeri\Desktop\ray\src\main.rs C:\Users\xxeri\Desktop\ray\src\renderer.rs

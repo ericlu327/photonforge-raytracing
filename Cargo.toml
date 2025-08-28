@@ -1,0 +1,12 @@
+[package]
+name = "photonforge_rt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+wgpu = "0.19"
+winit = "0.29"
+pollster = "0.3"
+glam = "0.27"
