@@ -1,3 +1,4 @@
+// === Camera UBO ===
 struct CameraUBO {
   origin     : vec3<f32>, _pad0 : f32,
   dir        : vec3<f32>, _pad1 : f32,
@@ -11,9 +12,8 @@ struct CameraUBO {
 @group(0) @binding(0) var<uniform> cam : CameraUBO;
 @group(0) @binding(1) var accum_in  : texture_storage_2d<rgba16float, read>;
 @group(0) @binding(2) var accum_out : texture_storage_2d<rgba16float, write>;
-@group(0) @binding(3) var accum_sample : texture_2d<f32>;
-@group(0) @binding(4) var samp : sampler;
 
+// === Utils ===
 fn rand(hash: vec2<u32>) -> f32 {
   var x = hash.x * 1664525u + 1013904223u + hash.y * 747796405u;
   x = (x ^ (x >> 16u)) * 2246822519u;
@@ -38,7 +38,7 @@ fn sphere_hit(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32,
   return Hit(t, n, albedo, emissive, mirror);
 }
 
-fn plane_hit(ro: vec3<f32>, rd: vec3<f32>, y: f32, albedo: vec3<f32>) -> Hit {
+fn plane_hit_y(ro: vec3<f32>, rd: vec3<f32>, y: f32, albedo: vec3<f32>) -> Hit {
   if (abs(rd.y) < 1e-4) { return Hit(1e30, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0); }
   let t = (y - ro.y) / rd.y;
   if (t < 1e-3) { return Hit(1e30, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0); }
@@ -48,7 +48,8 @@ fn plane_hit(ro: vec3<f32>, rd: vec3<f32>, y: f32, albedo: vec3<f32>) -> Hit {
 
 fn sky(rd: vec3<f32>) -> vec3<f32> {
   let t = 0.5 * (rd.y + 1.0);
-  return mix(vec3<f32>(0.8, 0.9, 1.0), vec3<f32>(0.2, 0.3, 0.6), t);
+  // linear gradient
+  return (1.0 - t) * vec3<f32>(0.2, 0.3, 0.6) + t * vec3<f32>(0.8, 0.9, 1.0);
 }
 
 fn onb(n: vec3<f32>) -> mat3x3<f32> {
@@ -66,6 +67,8 @@ fn cosine_sample_hemisphere(u: f32, v: f32) -> vec3<f32> {
   let z = sqrt(max(0.0, 1.0 - u));
   return vec3<f32>(x, y, z);
 }
+
+// Refraction + Fresnel
 fn refract_ray(v: vec3<f32>, n: vec3<f32>, eta: f32) -> vec3<f32> {
   let cosi = clamp(dot(-v, n), -1.0, 1.0);
   let cost2 = 1.0 - eta*eta*(1.0 - cosi*cosi);
@@ -75,12 +78,12 @@ fn refract_ray(v: vec3<f32>, n: vec3<f32>, eta: f32) -> vec3<f32> {
   return normalize(eta*v + (eta*cosi - sqrt(cost2))*n);
 }
 
-// Schlick approximation
 fn schlick_fresnel(cos_theta: f32, ior: f32) -> f32 {
   let r0 = pow((1.0 - ior) / (1.0 + ior), 2.0);
   return r0 + (1.0 - r0) * pow(1.0 - cos_theta, 5.0);
 }
 
+// === Entry ===
 @compute @workgroup_size(8,8,1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= cam.img_size.x || gid.y >= cam.img_size.y) { return; }
@@ -97,7 +100,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   );
   let jitter_uv = (jitter - 0.5) / res;
 
-  // fixed 60° FOV
+  // fixed 60° vertical FOV
   let fov_tan = tan(0.5 * 60.0 * 0.0174532925);
   var rd = normalize(
       cam.dir +
@@ -113,13 +116,24 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   loop {
     if (bounce > cam.max_bounce) { break; }
 
-    // scene: two spheres + ground plane
+    // --- Scene: two spheres + a glass sphere + ground plane ---
     var best = Hit(1e30, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
-    let s1 = sphere_hit(ro, rd, vec3<f32>(-1.2, 1.0, 0.0), 1.0, vec3<f32>(0.9, 0.25, 0.25), vec3<f32>(0.0), 0.0);
+
+    let s1 = sphere_hit(ro, rd, vec3<f32>(-1.2, 1.0, 0.0), 1.0,
+                        vec3<f32>(0.9, 0.25, 0.25), vec3<f32>(0.0), 0.0);
     if (s1.dist < best.dist) { best = s1; }
-    let s2 = sphere_hit(ro, rd, vec3<f32>( 1.2, 1.0, 0.0), 1.0, vec3<f32>(0.25, 0.9, 0.3), vec3<f32>(0.0), 1.0); // mirror
+
+    // perfect mirror
+    let s2 = sphere_hit(ro, rd, vec3<f32>( 1.2, 1.0, 0.0), 1.0,
+                        vec3<f32>(0.25, 0.9, 0.3), vec3<f32>(0.0), 1.0);
     if (s2.dist < best.dist) { best = s2; }
-    let pl = plane_hit(ro, rd, 0.0, vec3<f32>(0.8, 0.8, 0.8));
+
+    // glass sphere: store IOR in 'mirror' (>= 1.5 means dielectric)
+    let s3 = sphere_hit(ro, rd, vec3<f32>(0.0, 0.9, -0.5), 0.6,
+                        vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.0), 1.5);
+    if (s3.dist < best.dist) { best = s3; }
+
+    let pl = plane_hit_y(ro, rd, 0.0, vec3<f32>(0.8, 0.8, 0.8));
     if (pl.dist < best.dist) { best = pl; }
 
     if (best.dist == 1e30) {
@@ -130,20 +144,25 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = ro + rd * best.dist;
     let n = normalize(best.n);
 
-    // simple fake point light
+    // --- Lighting: one fake point light ---
     let light_pos = vec3<f32>(0.0, 5.0, 2.5);
     let toL = light_pos - p;
     let distL = length(toL);
     let ldir = toL / max(1e-6, distL);
     let n_dot_l = max(0.0, dot(n, ldir));
 
-    // hard shadow
+    // hard shadow against spheres (cheap)
     var shadowed = false;
     {
       let eps = 1e-3;
-      var h = sphere_hit(p + n*eps, ldir, vec3<f32>(-1.2,1.0,0.0), 1.0, vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+      var h = sphere_hit(p + n*eps, ldir, vec3<f32>(-1.2,1.0,0.0), 1.0,
+                         vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
       if (h.dist < distL) { shadowed = true; }
-      h = sphere_hit(p + n*eps, ldir, vec3<f32>(1.2,1.0,0.0), 1.0, vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+      h = sphere_hit(p + n*eps, ldir, vec3<f32>(1.2,1.0,0.0), 1.0,
+                     vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+      if (h.dist < distL) { shadowed = true; }
+      h = sphere_hit(p + n*eps, ldir, vec3<f32>(0.0,0.9,-0.5), 0.6,
+                     vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
       if (h.dist < distL) { shadowed = true; }
     }
 
@@ -153,19 +172,41 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       radiance += throughput * best.albedo * (light_color * n_dot_l * falloff);
     }
 
-    // bounce
+    // --- Scatter ---
     let seed0 = rand(vec2<u32>(u32(p.x*4096.0) ^ u32(p.y*8192.0) ^ u32(p.z*16384.0) ^ cam.frame_index,
                                u32(gid.x + gid.y)));
     let seed1 = rand(vec2<u32>(u32(p.z*2048.0) ^ cam.frame_index,
                                u32(gid.y*3u + 7u)));
 
-    if (best.mirror > 0.5) {
-      // perfect reflection
+    if (best.mirror >= 1.5) {
+      // GLASS (dielectric) — use 'mirror' as IOR
+      var n_face = n;
+      var eta = 1.0 / best.mirror;
+      let cosi = dot(-rd, n);
+      if (cosi < 0.0) {
+        // exiting
+        n_face = -n;
+        eta = best.mirror;
+      }
+      let reflect_prob = schlick_fresnel(abs(dot(-rd, n_face)), best.mirror);
+      let do_reflect = rand(vec2<u32>(cam.frame_index, gid.x ^ gid.y)) < reflect_prob;
+
+      if (do_reflect) {
+        rd = reflect(rd, n_face);
+      } else {
+        rd = refract_ray(rd, n_face, eta);
+      }
+      ro = p + rd * 1e-3;
+      throughput *= vec3<f32>(0.98, 0.99, 0.99); // slight attenuation
+
+    } else if (best.mirror > 0.5) {
+      // PERFECT MIRROR
       rd = reflect(rd, n);
       ro = p + n * 1e-3;
       throughput *= vec3<f32>(0.95);
+
     } else {
-      // diffuse
+      // DIFFUSE
       let TBN = onb(n);
       let local = cosine_sample_hemisphere(seed0, seed1);
       rd = normalize(TBN * local);
@@ -175,10 +216,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     bounce += 1u;
   }
-// progressive accumulation (use 2-arg textureLoad for storage textures)
-let prev = textureLoad(accum_in, vec2<i32>(i32(gid.x), i32(gid.y)));
-let f = f32(cam.frame_index);
-let acc = (prev.rgb * f + radiance) / max(1.0, f + 1.0);
-textureStore(accum_out, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(acc, 1.0));
 
+  // --- Progressive accumulation (storage textures: 2-arg textureLoad) ---
+  let prev = textureLoad(accum_in, vec2<i32>(i32(gid.x), i32(gid.y)));
+  let f = f32(cam.frame_index);
+  let acc = (prev.rgb * f + radiance) / max(1.0, f + 1.0);
+  textureStore(accum_out, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(acc, 1.0));
 }
