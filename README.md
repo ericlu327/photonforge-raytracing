@@ -1,10 +1,27 @@
-### Ray-Traced Shadows & Reflections for Games
-Real-time hybrid renderer: raster G-buffer -> DXR/Vulkan rays for shadows/reflections -> temporal+spatial denoise.
+# PhotonForge RT — Real-Time Path Tracer (wgpu / WGSL)
 
-**Features**
-- BVH (SAH, refit), PBR (GGX), blue-noise sampling
-- Temporal accumulation, variance estimation, atrous filter
-- ImGui HUD: ms per pass, spp, BVH stats
+**PhotonForge RT** is a lightweight real-time renderer written in Rust with [wgpu](https://github.com/gfx-rs/wgpu).  
+It demonstrates progressive path tracing in compute shaders (WGSL), supporting diffuse, mirror, and glass materials,  
+with live performance metrics in the window title.
 
-**Performance (1080p, RTX4070)**
-- G-buffer: 0.00 ms | RT Shadows: 0.03 ms | RT Refl: 0.00 ms | Denoise: 4.93 ms | Total: 4.96 ms
+---
+
+## ✨ Features
+
+- **Progressive path tracing** in WGSL compute
+- **Materials**: diffuse, perfect mirror, dielectric (glass/refraction via Schlick + Snell)
+- **Lighting**: point light with hard shadows + sky gradient
+- **Progressive accumulation** (reduces noise over frames)
+- **Controls**:  
+  - WASD + QE for movement  
+  - Mouse drag to rotate camera  
+
+- **HUD**: window title shows FPS + per-pass timings (CPU-measured)
+---
+
+## 📊 Performance (RTX 4070 @ 1080p)
+
+Example run: **16 SPP, 4 bounces, 120 FPS**
+
+
+![example image](image.png)
