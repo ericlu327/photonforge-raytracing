@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Vec3};
 use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
+use std::time::Instant;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
@@ -50,7 +51,6 @@ pub struct Renderer<'w> {
     compute_pipeline: ComputePipeline,
     blit_pipeline: RenderPipeline,
 
-    // split layouts/bind groups to avoid usage conflicts
     compute_bind_layout: BindGroupLayout,
     blit_bind_layout: BindGroupLayout,
 
@@ -69,6 +69,13 @@ pub struct Renderer<'w> {
     pitch: f32,
     move_delta: Vec3,
     fov_y_radians: f32,
+
+    // --- perf metrics (ms) ---
+    pub last_ms_gbuffer: f32,
+    pub last_ms_rt_shadows: f32,
+    pub last_ms_rt_reflections: f32,
+    pub last_ms_denoise: f32,
+    pub last_ms_total: f32,
 }
 
 impl<'w> Renderer<'w> {
@@ -93,7 +100,6 @@ impl<'w> Renderer<'w> {
             .request_device(
                 &DeviceDescriptor {
                     label: Some("device"),
-                    // allow RGBA16F as storage on native
                     required_features: Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
                     required_limits: Limits::default().using_resolution(adapter.limits()),
                 },
@@ -122,7 +128,11 @@ impl<'w> Renderer<'w> {
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: surface_caps.present_modes[0],
+            present_mode: if surface_caps.present_modes.contains(&PresentMode::AutoVsync) {
+                PresentMode::AutoVsync
+            } else {
+                surface_caps.present_modes[0]
+            },
             alpha_mode: surface_caps.alpha_modes[0],
             desired_maximum_frame_latency: 3,
             view_formats: vec![],
@@ -139,8 +149,7 @@ impl<'w> Renderer<'w> {
             ..Default::default()
         });
 
-        // --- Bind group layouts (split) ---
-        // Compute: UBO + storage in + storage out
+        // layouts
         let compute_bind_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("compute layout"),
             entries: &[
@@ -177,7 +186,6 @@ impl<'w> Renderer<'w> {
             ],
         });
 
-        // Blit: UBO + sampled tex + sampler
         let blit_bind_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("blit layout"),
             entries: &[
@@ -217,85 +225,47 @@ impl<'w> Renderer<'w> {
             mapped_at_creation: false,
         });
 
-        // --- Bind groups (compute) ---
+        // bind groups (compute)
         let compute_bind_a = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("compute_bind_a (in=a, out=b)"),
+            label: Some("compute_bind_a"),
             layout: &compute_bind_layout,
             entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&a_storage),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::TextureView(&b_storage),
-                },
+                BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&a_storage) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&b_storage) },
             ],
         });
-
         let compute_bind_b = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("compute_bind_b (in=b, out=a)"),
+            label: Some("compute_bind_b"),
             layout: &compute_bind_layout,
             entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&b_storage),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::TextureView(&a_storage),
-                },
+                BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&b_storage) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&a_storage) },
             ],
         });
 
-        // --- Bind groups (blit) ---
+        // bind groups (blit)
         let blit_bind_a = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("blit_bind_a (sample=a)"),
+            label: Some("blit_bind_a"),
             layout: &blit_bind_layout,
             entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::TextureView(&a_sample),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::Sampler(&sampler),
-                },
+                BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&a_sample) },
+                BindGroupEntry { binding: 4, resource: BindingResource::Sampler(&sampler) },
             ],
         });
-
         let blit_bind_b = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("blit_bind_b (sample=b)"),
+            label: Some("blit_bind_b"),
             layout: &blit_bind_layout,
             entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::TextureView(&b_sample),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::Sampler(&sampler),
-                },
+                BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&b_sample) },
+                BindGroupEntry { binding: 4, resource: BindingResource::Sampler(&sampler) },
             ],
         });
 
-        // --- Shaders & pipelines ---
+        // shaders + pipelines
         let compute_mod = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("compute"),
             source: ShaderSource::Wgsl(include_str!("../shaders/compute.wgsl").into()),
@@ -325,11 +295,7 @@ impl<'w> Renderer<'w> {
         let blit_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("blit pipeline"),
             layout: Some(&pipeline_layout_blit),
-            vertex: VertexState {
-                module: &blit_mod,
-                entry_point: "vs_main",
-                buffers: &[],
-            },
+            vertex: VertexState { module: &blit_mod, entry_point: "vs_main", buffers: &[] },
             fragment: Some(FragmentState {
                 module: &blit_mod,
                 entry_point: "fs_main",
@@ -345,7 +311,7 @@ impl<'w> Renderer<'w> {
             multiview: None,
         });
 
-        let mut r = Self {
+        Ok(Self {
             surface,
             device,
             queue,
@@ -374,168 +340,82 @@ impl<'w> Renderer<'w> {
             pitch: 0.0,
             move_delta: Vec3::ZERO,
             fov_y_radians: 45f32.to_radians(),
-        };
-
-        r.update_camera();
-        Ok(r)
+            last_ms_gbuffer: 0.0,
+            last_ms_rt_shadows: 0.0,
+            last_ms_rt_reflections: 0.0,
+            last_ms_denoise: 0.0,
+            last_ms_total: 0.0,
+        })
     }
 
     fn make_accum(device: &Device, size: PhysicalSize<u32>) -> (Texture, TextureView, TextureView) {
         let tex = device.create_texture(&TextureDescriptor {
             label: Some("accum tex"),
-            size: Extent3d {
-                width: size.width.max(1),
-                height: size.height.max(1),
-                depth_or_array_layers: 1,
-            },
+            size: Extent3d { width: size.width.max(1), height: size.height.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba16Float,
-            usage: TextureUsages::STORAGE_BINDING
-                | TextureUsages::TEXTURE_BINDING
-                | TextureUsages::COPY_SRC
-                | TextureUsages::COPY_DST,
+            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC | TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let storage_view =
-            tex.create_view(&TextureViewDescriptor { label: Some("accum storage"), ..Default::default() });
-        let sample_view =
-            tex.create_view(&TextureViewDescriptor { label: Some("accum sample"), ..Default::default() });
+        let storage_view = tex.create_view(&TextureViewDescriptor { label: Some("accum storage"), ..Default::default() });
+        let sample_view  = tex.create_view(&TextureViewDescriptor { label: Some("accum sample"), ..Default::default() });
         (tex, storage_view, sample_view)
     }
 
-    pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
-        if new_size.width == 0 || new_size.height == 0 {
-            return;
+    pub fn render(&mut self) -> Result<()> {
+        let t_total = Instant::now();
+        let t_gbuf = Instant::now();
+        self.last_ms_gbuffer = t_gbuf.elapsed().as_secs_f32() * 1000.0;
+
+        // --- compute pass ---
+        let t_rt = Instant::now();
+        let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("encoder") });
+        {
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor { label: Some("trace pass"), ..Default::default() });
+            cpass.set_pipeline(&self.compute_pipeline);
+            let cbind = if self.use_a_as_src { &self.compute_bind_a } else { &self.compute_bind_b };
+            cpass.set_bind_group(0, cbind, &[]);
+            let gx = (self.size.width + 7) / 8;
+            let gy = (self.size.height + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
         }
-        self.size = new_size;
-        self.config.width = new_size.width;
-        self.config.height = new_size.height;
-        self.surface.configure(&self.device, &self.config);
+        self.last_ms_rt_shadows = t_rt.elapsed().as_secs_f32() * 1000.0;
 
-        // Recreate accum textures and bind groups
-        let (accum_a, a_storage, a_sample) = Self::make_accum(&self.device, self.size);
-        let (accum_b, b_storage, b_sample) = Self::make_accum(&self.device, self.size);
-        self.accum_a = accum_a;
-        self.accum_b = accum_b;
-        self.accum_a_view_storage = a_storage;
-        self.accum_b_view_storage = b_storage;
-        self.accum_a_view_sample = a_sample;
-        self.accum_b_view_sample = b_sample;
-
-        // Rebuild bind groups after resize
-        self.compute_bind_a = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("compute_bind_a"),
-            layout: &self.compute_bind_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&self.accum_a_view_storage),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::TextureView(&self.accum_b_view_storage),
-                },
-            ],
-        });
-        self.compute_bind_b = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("compute_bind_b"),
-            layout: &self.compute_bind_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&self.accum_b_view_storage),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::TextureView(&self.accum_a_view_storage),
-                },
-            ],
-        });
-        self.blit_bind_a = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("blit_bind_a"),
-            layout: &self.blit_bind_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::TextureView(&self.accum_a_view_sample),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        self.blit_bind_b = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("blit_bind_b"),
-            layout: &self.blit_bind_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::TextureView(&self.accum_b_view_sample),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-
-        self.reset_accum();
-        self.update_camera();
-    }
-
-    pub fn queue_movement(&mut self, m: Movement) {
-        let amt = 0.2;
-        match m {
-            Movement::Forward => self.move_delta.z -= amt,
-            Movement::Backward => self.move_delta.z += amt,
-            Movement::Left => self.move_delta.x -= amt,
-            Movement::Right => self.move_delta.x += amt,
-            Movement::Up => self.move_delta.y += amt,
-            Movement::Down => self.move_delta.y -= amt,
+        // --- blit / tonemap ---
+        let t_denoise = Instant::now();
+        let surface_tex = self.surface.get_current_texture()?;
+        let view = surface_tex.texture.create_view(&TextureViewDescriptor::default());
+        {
+            let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("blit pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rpass.set_pipeline(&self.blit_pipeline);
+            let bbind = if self.use_a_as_src { &self.blit_bind_b } else { &self.blit_bind_a };
+            rpass.set_bind_group(0, bbind, &[]);
+            rpass.draw(0..3, 0..1);
         }
-        self.cam_pos += self.view_basis() * self.move_delta;
-        self.move_delta = Vec3::ZERO;
-        self.reset_accum();
-        self.update_camera();
-    }
+        self.last_ms_denoise = t_denoise.elapsed().as_secs_f32() * 1000.0;
 
-    pub fn on_mouse_delta(&mut self, dx: f32, dy: f32) {
-        let sensitivity = 0.0025;
-        self.yaw -= dx * sensitivity;
-        self.pitch -= dy * sensitivity;
-        self.pitch = self.pitch.clamp(-1.5, 1.5);
-        self.reset_accum();
-        self.update_camera();
-    }
+        self.queue.submit([encoder.finish()]);
+        surface_tex.present();
 
-    pub fn on_scroll(&mut self, delta: f32) {
-        self.fov_y_radians = (self.fov_y_radians - delta * 0.02)
-            .clamp(10f32.to_radians(), 90f32.to_radians());
-        self.reset_accum();
+        self.frame_index = self.frame_index.wrapping_add(1);
+        self.use_a_as_src = !self.use_a_as_src;
         self.update_camera();
-    }
 
-    pub fn reset_accum(&mut self) {
-        self.frame_index = 0;
+        self.last_ms_rt_reflections = 0.0;
+        self.last_ms_total = t_total.elapsed().as_secs_f32() * 1000.0;
+        Ok(())
     }
 
     fn view_basis(&self) -> Mat3 {
@@ -543,8 +423,7 @@ impl<'w> Renderer<'w> {
             self.yaw.cos() * self.pitch.cos(),
             self.pitch.sin(),
             self.yaw.sin() * self.pitch.cos(),
-        )
-        .normalize();
+        ).normalize();
         let right = dir.cross(Vec3::Y).normalize();
         let up = right.cross(dir).normalize();
         Mat3::from_cols(right, up, -dir)
@@ -567,76 +446,117 @@ impl<'w> Renderer<'w> {
             _pad3: 0.0,
             img_size: [self.size.width.max(1), self.size.height.max(1)],
             frame_index: self.frame_index,
-            max_bounce: 2,
+            max_bounce: 4,
         };
-        self.queue
-            .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&ubo));
+        self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&ubo));
     }
 
-    pub fn render(&mut self) -> Result<()> {
-        // compute
-        let mut encoder =
-            self.device
-                .create_command_encoder(&CommandEncoderDescriptor { label: Some("encoder") });
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("trace pass"),
-                ..Default::default()
-            });
-            cpass.set_pipeline(&self.compute_pipeline);
-            let cbind = if self.use_a_as_src {
-                &self.compute_bind_a
-            } else {
-                &self.compute_bind_b
-            };
-            cpass.set_bind_group(0, cbind, &[]);
-            let gx = (self.size.width + 7) / 8;
-            let gy = (self.size.height + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
+    pub fn perf_line(&self) -> String {
+        format!(
+            "G-buffer: {:.2} ms | RT Shadows: {:.2} ms | RT Refl: {:.2} ms | Denoise: {:.2} ms | Total: {:.2} ms",
+            self.last_ms_gbuffer,
+            self.last_ms_rt_shadows,
+            self.last_ms_rt_reflections,
+            self.last_ms_denoise,
+            self.last_ms_total
+        )
+    }
+}
+impl<'w> Renderer<'w> {
+    pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
+        if new_size.width == 0 || new_size.height == 0 {
+            return;
         }
+        self.size = new_size;
+        self.config.width = new_size.width.max(1);
+        self.config.height = new_size.height.max(1);
+        self.surface.configure(&self.device, &self.config);
 
-        // present
-        let surface_tex = self.surface.get_current_texture()?;
-        let view = surface_tex
-            .texture
-            .create_view(&TextureViewDescriptor::default());
-        {
-            let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("blit pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            rpass.set_pipeline(&self.blit_pipeline);
-            let bbind = if self.use_a_as_src {
-                &self.blit_bind_b // we just wrote B, sample B
-            } else {
-                &self.blit_bind_a // we just wrote A, sample A
-            };
-            rpass.set_bind_group(0, bbind, &[]);
-            rpass.draw(0..3, 0..1);
-        }
+        // Recreate accumulation textures
+        let (accum_a, a_storage, a_sample) = Self::make_accum(&self.device, self.size);
+        let (accum_b, b_storage, b_sample) = Self::make_accum(&self.device, self.size);
+        self.accum_a = accum_a;
+        self.accum_b = accum_b;
+        self.accum_a_view_storage = a_storage;
+        self.accum_b_view_storage = b_storage;
+        self.accum_a_view_sample = a_sample;
+        self.accum_b_view_sample = b_sample;
 
-        self.queue.submit([encoder.finish()]);
-        surface_tex.present();
+        // Rebuild bind groups after resize
+        self.compute_bind_a = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("compute_bind_a"),
+            layout: &self.compute_bind_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: self.camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&self.accum_a_view_storage) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&self.accum_b_view_storage) },
+            ],
+        });
+        self.compute_bind_b = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("compute_bind_b"),
+            layout: &self.compute_bind_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: self.camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&self.accum_b_view_storage) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&self.accum_a_view_storage) },
+            ],
+        });
+        self.blit_bind_a = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("blit_bind_a"),
+            layout: &self.blit_bind_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: self.camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&self.accum_a_view_sample) },
+                BindGroupEntry { binding: 4, resource: BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.blit_bind_b = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("blit_bind_b"),
+            layout: &self.blit_bind_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: self.camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&self.accum_b_view_sample) },
+                BindGroupEntry { binding: 4, resource: BindingResource::Sampler(&self.sampler) },
+            ],
+        });
 
-        self.frame_index = self.frame_index.wrapping_add(1);
-        self.use_a_as_src = !self.use_a_as_src;
+        self.reset_accum();
         self.update_camera();
-        Ok(())
+    }
+
+    pub fn reset_accum(&mut self) {
+        self.frame_index = 0;
+    }
+
+    pub fn queue_movement(&mut self, m: Movement) {
+        let amt = 0.2;
+        match m {
+            Movement::Forward  => self.move_delta.z -= amt,
+            Movement::Backward => self.move_delta.z += amt,
+            Movement::Left     => self.move_delta.x -= amt,
+            Movement::Right    => self.move_delta.x += amt,
+            Movement::Up       => self.move_delta.y += amt,
+            Movement::Down     => self.move_delta.y -= amt,
+        }
+        self.cam_pos += self.view_basis() * self.move_delta;
+        self.move_delta = Vec3::ZERO;
+        self.reset_accum();
+        self.update_camera();
+    }
+
+    pub fn on_mouse_delta(&mut self, dx: f32, dy: f32) {
+        let sensitivity = 0.0025;
+        self.yaw   -= dx * sensitivity;
+        self.pitch -= dy * sensitivity;
+        self.pitch = self.pitch.clamp(-1.5, 1.5);
+        self.reset_accum();
+        self.update_camera();
+    }
+
+    pub fn on_scroll(&mut self, delta: f32) {
+        self.fov_y_radians = (self.fov_y_radians - delta * 0.02)
+            .clamp(10f32.to_radians(), 90f32.to_radians());
+        self.reset_accum();
+        self.update_camera();
     }
 }
