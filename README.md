@@ -21,7 +21,10 @@ with live performance metrics in the window title.
 
 ## 📊 Performance (RTX 4070 @ 1080p)
 
-Example run: **16 SPP, 4 bounces, 120 FPS**
+Example run: **16 SPP, 4 bounces, ~125 FPS**
 
 
-![example image](image.png)
+![example image](image-1.png)
+
+
+![example image 2](image.png)
