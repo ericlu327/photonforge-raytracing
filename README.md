@@ -25,3 +25,6 @@ Example run: **16 SPP, 4 bounces, ~125 FPS**
 
 
 ![example image](image-1.png)
+
+
+![example image 2](image.png)
