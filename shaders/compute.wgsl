@@ -9,6 +9,7 @@ struct CameraUBO {
   max_bounce : u32,
 };
 
+// Bindings for the **compute** pass only
 @group(0) @binding(0) var<uniform> cam : CameraUBO;
 @group(0) @binding(1) var accum_in  : texture_storage_2d<rgba16float, read>;
 @group(0) @binding(2) var accum_out : texture_storage_2d<rgba16float, write>;
@@ -48,7 +49,6 @@ fn plane_hit_y(ro: vec3<f32>, rd: vec3<f32>, y: f32, albedo: vec3<f32>) -> Hit {
 
 fn sky(rd: vec3<f32>) -> vec3<f32> {
   let t = 0.5 * (rd.y + 1.0);
-  // linear gradient
   return (1.0 - t) * vec3<f32>(0.2, 0.3, 0.6) + t * vec3<f32>(0.8, 0.9, 1.0);
 }
 
@@ -72,9 +72,7 @@ fn cosine_sample_hemisphere(u: f32, v: f32) -> vec3<f32> {
 fn refract_ray(v: vec3<f32>, n: vec3<f32>, eta: f32) -> vec3<f32> {
   let cosi = clamp(dot(-v, n), -1.0, 1.0);
   let cost2 = 1.0 - eta*eta*(1.0 - cosi*cosi);
-  if (cost2 < 0.0) { // total internal reflection
-    return reflect(v, n);
-  }
+  if (cost2 < 0.0) { return reflect(v, n); } // TIR -> reflect
   return normalize(eta*v + (eta*cosi - sqrt(cost2))*n);
 }
 
@@ -90,136 +88,121 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let px = vec2<f32>(f32(gid.x), f32(gid.y));
   let res = vec2<f32>(f32(cam.img_size.x), f32(cam.img_size.y));
-  let uv = (px + vec2<f32>(0.5, 0.5)) / res * 2.0 - 1.0;
+  let uv_base = (px + vec2<f32>(0.5, 0.5)) / res * 2.0 - 1.0;
   let aspect = res.x / max(1.0, res.y);
-
-  // jitter per frame/pixel
-  let jitter = vec2<f32>(
-      rand(vec2<u32>(gid.x + cam.frame_index, gid.y)),
-      rand(vec2<u32>(gid.y + cam.frame_index*3u, gid.x))
-  );
-  let jitter_uv = (jitter - 0.5) / res;
-
-  // fixed 60° vertical FOV
   let fov_tan = tan(0.5 * 60.0 * 0.0174532925);
-  var rd = normalize(
+
+  // Multi-sample per dispatch (4 spp)
+  let spp: u32 = 16u;
+  var sum_radiance = vec3<f32>(0.0);
+
+  for (var s: u32 = 0u; s < spp; s = s + 1u) {
+    // per-sample jitter
+    let jitter = vec2<f32>(
+      rand(vec2<u32>(gid.x + cam.frame_index*13u + s*97u, gid.y + s*3u)),
+      rand(vec2<u32>(gid.y + cam.frame_index*31u + s*17u, gid.x + s*5u))
+    );
+    let jitter_uv = (jitter - 0.5) / res;
+
+    var rd = normalize(
       cam.dir +
-      cam.right * (uv.x + jitter_uv.x) * aspect * fov_tan * 2.0 +
-      cam.up    * (uv.y + jitter_uv.y)           * fov_tan * 2.0
-  );
-  var ro = cam.origin;
+      cam.right * (uv_base.x + jitter_uv.x) * aspect * fov_tan * 2.0 +
+      cam.up    * (uv_base.y + jitter_uv.y)           * fov_tan * 2.0
+    );
+    var ro = cam.origin;
 
-  var throughput = vec3<f32>(1.0);
-  var radiance  = vec3<f32>(0.0);
+    var throughput = vec3<f32>(1.0);
+    var radiance  = vec3<f32>(0.0);
 
-  var bounce: u32 = 0u;
-  loop {
-    if (bounce > cam.max_bounce) { break; }
+    var bounce: u32 = 0u;
+    loop {
+      if (bounce > cam.max_bounce) { break; }
 
-    // --- Scene: two spheres + a glass sphere + ground plane ---
-    var best = Hit(1e30, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+      // --- Scene ---
+      var best = Hit(1e30, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+      let s1 = sphere_hit(ro, rd, vec3<f32>(-1.2, 1.0, 0.0), 1.0, vec3<f32>(0.9, 0.25, 0.25), vec3<f32>(0.0), 0.0);
+      if (s1.dist < best.dist) { best = s1; }
+      let s2 = sphere_hit(ro, rd, vec3<f32>( 1.2, 1.0, 0.0), 1.0, vec3<f32>(0.25, 0.9, 0.3), vec3<f32>(0.0), 1.0);
+      if (s2.dist < best.dist) { best = s2; }
+      let s3 = sphere_hit(ro, rd, vec3<f32>(0.0, 0.9, -0.5), 0.6, vec3<f32>(1.0), vec3<f32>(0.0), 1.5); // glass
+      if (s3.dist < best.dist) { best = s3; }
+      let pl = plane_hit_y(ro, rd, 0.0, vec3<f32>(0.8, 0.8, 0.8));
+      if (pl.dist < best.dist) { best = pl; }
 
-    let s1 = sphere_hit(ro, rd, vec3<f32>(-1.2, 1.0, 0.0), 1.0,
-                        vec3<f32>(0.9, 0.25, 0.25), vec3<f32>(0.0), 0.0);
-    if (s1.dist < best.dist) { best = s1; }
-
-    // perfect mirror
-    let s2 = sphere_hit(ro, rd, vec3<f32>( 1.2, 1.0, 0.0), 1.0,
-                        vec3<f32>(0.25, 0.9, 0.3), vec3<f32>(0.0), 1.0);
-    if (s2.dist < best.dist) { best = s2; }
-
-    // glass sphere: store IOR in 'mirror' (>= 1.5 means dielectric)
-    let s3 = sphere_hit(ro, rd, vec3<f32>(0.0, 0.9, -0.5), 0.6,
-                        vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.0), 1.5);
-    if (s3.dist < best.dist) { best = s3; }
-
-    let pl = plane_hit_y(ro, rd, 0.0, vec3<f32>(0.8, 0.8, 0.8));
-    if (pl.dist < best.dist) { best = pl; }
-
-    if (best.dist == 1e30) {
-      radiance += throughput * sky(rd);
-      break;
-    }
-
-    let p = ro + rd * best.dist;
-    let n = normalize(best.n);
-
-    // --- Lighting: one fake point light ---
-    let light_pos = vec3<f32>(0.0, 5.0, 2.5);
-    let toL = light_pos - p;
-    let distL = length(toL);
-    let ldir = toL / max(1e-6, distL);
-    let n_dot_l = max(0.0, dot(n, ldir));
-
-    // hard shadow against spheres (cheap)
-    var shadowed = false;
-    {
-      let eps = 1e-3;
-      var h = sphere_hit(p + n*eps, ldir, vec3<f32>(-1.2,1.0,0.0), 1.0,
-                         vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
-      if (h.dist < distL) { shadowed = true; }
-      h = sphere_hit(p + n*eps, ldir, vec3<f32>(1.2,1.0,0.0), 1.0,
-                     vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
-      if (h.dist < distL) { shadowed = true; }
-      h = sphere_hit(p + n*eps, ldir, vec3<f32>(0.0,0.9,-0.5), 0.6,
-                     vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
-      if (h.dist < distL) { shadowed = true; }
-    }
-
-    let light_color = vec3<f32>(8.0, 7.5, 7.0);
-    if (!shadowed) {
-      let falloff = 1.0 / (1.0 + 0.1*distL + 0.01*distL*distL);
-      radiance += throughput * best.albedo * (light_color * n_dot_l * falloff);
-    }
-
-    // --- Scatter ---
-    let seed0 = rand(vec2<u32>(u32(p.x*4096.0) ^ u32(p.y*8192.0) ^ u32(p.z*16384.0) ^ cam.frame_index,
-                               u32(gid.x + gid.y)));
-    let seed1 = rand(vec2<u32>(u32(p.z*2048.0) ^ cam.frame_index,
-                               u32(gid.y*3u + 7u)));
-
-    if (best.mirror >= 1.5) {
-      // GLASS (dielectric) — use 'mirror' as IOR
-      var n_face = n;
-      var eta = 1.0 / best.mirror;
-      let cosi = dot(-rd, n);
-      if (cosi < 0.0) {
-        // exiting
-        n_face = -n;
-        eta = best.mirror;
+      if (best.dist == 1e30) {
+        radiance += throughput * sky(rd);
+        break;
       }
-      let reflect_prob = schlick_fresnel(abs(dot(-rd, n_face)), best.mirror);
-      let do_reflect = rand(vec2<u32>(cam.frame_index, gid.x ^ gid.y)) < reflect_prob;
 
-      if (do_reflect) {
-        rd = reflect(rd, n_face);
+      let p = ro + rd * best.dist;
+      let n = normalize(best.n);
+
+      // --- Direct light + shadows ---
+      let light_pos = vec3<f32>(0.0, 5.0, 2.5);
+      let toL = light_pos - p;
+      let distL = length(toL);
+      let ldir = toL / max(1e-6, distL);
+      let n_dot_l = max(0.0, dot(n, ldir));
+      var shadowed = false;
+      {
+        let eps = 1e-3;
+        var h = sphere_hit(p + n*eps, ldir, vec3<f32>(-1.2,1.0,0.0), 1.0, vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+        if (h.dist < distL) { shadowed = true; }
+        h = sphere_hit(p + n*eps, ldir, vec3<f32>(1.2,1.0,0.0), 1.0, vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+        if (h.dist < distL) { shadowed = true; }
+        h = sphere_hit(p + n*eps, ldir, vec3<f32>(0.0,0.9,-0.5), 0.6, vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
+        if (h.dist < distL) { shadowed = true; }
+      }
+      let light_color = vec3<f32>(8.0, 7.5, 7.0);
+      if (!shadowed) {
+        let falloff = 1.0 / (1.0 + 0.1*distL + 0.01*distL*distL);
+        radiance += throughput * best.albedo * (light_color * n_dot_l * falloff);
+      }
+
+      // --- Scatter ---
+      let seed0 = rand(vec2<u32>(u32(p.x*4096.0) ^ u32(p.y*8192.0) ^ u32(p.z*16384.0) ^ cam.frame_index ^ s,
+                                 u32(gid.x + gid.y + s)));
+      let seed1 = rand(vec2<u32>(u32(p.z*2048.0) ^ cam.frame_index ^ (s*11u),
+                                 u32(gid.y*3u + 7u + s)));
+
+      if (best.mirror >= 1.5) {
+        // GLASS (dielectric) — store IOR in 'mirror'
+        var n_face = n;
+        var eta = 1.0 / best.mirror;
+        let cosi = dot(-rd, n);
+        if (cosi < 0.0) { n_face = -n; eta = best.mirror; } // exiting
+        let reflect_prob = schlick_fresnel(abs(dot(-rd, n_face)), best.mirror);
+        let do_reflect = rand(vec2<u32>(cam.frame_index + s, gid.x ^ gid.y)) < reflect_prob;
+        if (do_reflect) { rd = reflect(rd, n_face); }
+        else { rd = refract_ray(rd, n_face, eta); }
+        ro = p + rd * 1e-3;
+        throughput *= vec3<f32>(0.98, 0.99, 0.99);
+      } else if (best.mirror > 0.5) {
+        // PERFECT MIRROR
+        rd = reflect(rd, n);
+        ro = p + n * 1e-3;
+        throughput *= vec3<f32>(0.95);
       } else {
-        rd = refract_ray(rd, n_face, eta);
+        // DIFFUSE
+        let TBN = onb(n);
+        let local = cosine_sample_hemisphere(seed0, seed1);
+        rd = normalize(TBN * local);
+        ro = p + n * 1e-3;
+        throughput *= best.albedo;
       }
-      ro = p + rd * 1e-3;
-      throughput *= vec3<f32>(0.98, 0.99, 0.99); // slight attenuation
 
-    } else if (best.mirror > 0.5) {
-      // PERFECT MIRROR
-      rd = reflect(rd, n);
-      ro = p + n * 1e-3;
-      throughput *= vec3<f32>(0.95);
-
-    } else {
-      // DIFFUSE
-      let TBN = onb(n);
-      let local = cosine_sample_hemisphere(seed0, seed1);
-      rd = normalize(TBN * local);
-      ro = p + n * 1e-3;
-      throughput *= best.albedo;
+      // gentle clamp for stability
+      throughput = min(throughput, vec3<f32>(8.0));
+      bounce += 1u;
     }
 
-    bounce += 1u;
+    sum_radiance += radiance;
   }
 
-  // --- Progressive accumulation (storage textures: 2-arg textureLoad) ---
+  // Progressive accumulation (storage textures: 2-arg textureLoad)
   let prev = textureLoad(accum_in, vec2<i32>(i32(gid.x), i32(gid.y)));
-  let f = f32(cam.frame_index);
-  let acc = (prev.rgb * f + radiance) / max(1.0, f + 1.0);
-  textureStore(accum_out, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(acc, 1.0));
+  let prev_count = f32(cam.frame_index * spp);
+  let new_sum = prev.rgb * prev_count + sum_radiance;
+  let new_avg = new_sum / (prev_count + f32(spp));
+  textureStore(accum_out, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(new_avg, 1.0));
 }

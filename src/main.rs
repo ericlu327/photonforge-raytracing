@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use winit::{
     event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -29,6 +30,9 @@ async fn run() -> Result<()> {
     let mut mouse_down = false;
     let mut last_mouse_pos: Option<(f32, f32)> = None;
     let win_for_loop = window.clone(); // capture a clone for the event loop
+    let mut frames: u32 = 0;
+    let mut last = Instant::now();
+    let win_for_loop = window.clone();
 
     event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
@@ -40,6 +44,8 @@ async fn run() -> Result<()> {
                 WindowEvent::RedrawRequested => {
                     if let Err(e) = renderer.render() {
                         eprintln!("render error: {e:?}");
+                    } else {
+                        frames += 1
                     }
                 }
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
@@ -74,6 +80,12 @@ async fn run() -> Result<()> {
             },
             Event::AboutToWait => {
                 // Request redraw each tick on the Arc<Window>
+                if last.elapsed() >= Duration::from_secs(1) {
+                    let fps = frames;
+                    frames = 0;
+                    last = Instant::now();
+                    win_for_loop.set_title(&format!("PhotonForge RT — {} FPS", fps));
+                }
                 win_for_loop.request_redraw();
             }
             _ => {}
